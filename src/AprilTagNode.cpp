@@ -114,6 +114,7 @@ private:
     std::unordered_map<int, std::string> tag_frames;
     std::unordered_map<int, double> tag_sizes;
     std::atomic<bool> z_up;
+    std::atomic<bool> enabled;
 
     std::function<void(apriltag_family_t *)> tf_destructor;
 
@@ -133,6 +134,7 @@ AprilTagNode::AprilTagNode(const rclcpp::NodeOptions &options)
       // parameter
       cb_parameter(add_on_set_parameters_callback(std::bind(&AprilTagNode::onParameter, this, std::placeholders::_1))),
       td(apriltag_detector_create()),
+      enabled(false),
       // topics
       sub_cam(image_transport::create_camera_subscription(this, "image_rect", std::bind(&AprilTagNode::onCamera, this, std::placeholders::_1, std::placeholders::_2), declare_parameter("image_transport", "raw", descr({}, true)), rmw_qos_profile_default)),
       pub_detections(create_publisher<apriltag_msgs::msg::AprilTagDetectionArray>("detections", rclcpp::QoS(1))),
@@ -158,6 +160,7 @@ AprilTagNode::AprilTagNode(const rclcpp::NodeOptions &options)
     declare_parameter<int>("max_hamming", 0, descr("reject detections with more corrected bits than allowed"));
     declare_parameter("profile", false, descr("print profiling information to stdout"));
     declare_parameter<bool>("z_up", true, descr("let the z axis of the tag frame point up"));
+    declare_parameter<bool>("enabled", false);
 
     if (!frames.empty())
     {
@@ -205,6 +208,9 @@ AprilTagNode::~AprilTagNode()
 void AprilTagNode::onCamera(const sensor_msgs::msg::Image::ConstSharedPtr &msg_img,
                             const sensor_msgs::msg::CameraInfo::ConstSharedPtr &msg_ci)
 {
+    if (!enabled)
+        return;
+
     // precompute inverse projection matrix
     const Mat3 Pinv = Eigen::Map<const Eigen::Matrix<double, 3, 4, Eigen::RowMajor>>(msg_ci->p.data()).leftCols<3>().inverse();
 
@@ -290,6 +296,7 @@ AprilTagNode::onParameter(const std::vector<rclcpp::Parameter> &parameters)
         IF("max_hamming", max_hamming)
         IF("profile", profile)
         IF("z_up", z_up)
+        IF("enabled", enabled)
     }
 
     mutex.unlock();
