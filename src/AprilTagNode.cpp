@@ -15,6 +15,8 @@
 #include <sensor_msgs/msg/image.hpp>
 #include <tf2_ros/transform_broadcaster.h>
 
+#include <cartographer_ros_msgs/msg/landmark_entry.hpp>
+#include <cartographer_ros_msgs/msg/landmark_list.hpp>
 // apriltag
 #include "tag_functions.hpp"
 #include <apriltag.h>
@@ -71,6 +73,9 @@ private:
     // parameter
     std::mutex mutex;
     double tag_edge_size;
+    double translation_weight_;
+    double rotation_weight_;
+    double min_acceptable_distance_;
     std::atomic<int> max_hamming;
     std::atomic<bool> profile;
     std::unordered_map<int, std::string> tag_frames;
@@ -80,6 +85,7 @@ private:
 
     const image_transport::CameraSubscriber sub_cam;
     const rclcpp::Publisher<apriltag_msgs::msg::AprilTagDetectionArray>::SharedPtr pub_detections;
+    const rclcpp::Publisher<cartographer_ros_msgs::msg::LandmarkList>::SharedPtr pub_landmarks;
     tf2_ros::TransformBroadcaster tf_broadcaster;
 
     pose_estimation_f estimate_pose = nullptr;
@@ -100,6 +106,7 @@ AprilTagNode::AprilTagNode(const rclcpp::NodeOptions& options)
     // topics
     sub_cam(image_transport::create_camera_subscription(this, "image_rect", std::bind(&AprilTagNode::onCamera, this, std::placeholders::_1, std::placeholders::_2), declare_parameter("image_transport", "raw", descr({}, true)), rmw_qos_profile_sensor_data)),
     pub_detections(create_publisher<apriltag_msgs::msg::AprilTagDetectionArray>("detections", rclcpp::QoS(1))),
+    pub_landmarks(create_publisher<cartographer_ros_msgs::msg::LandmarkList>("apriltag/landmark", rclcpp::QoS(1))),
     tf_broadcaster(this)
 {
     // read-only parameters
@@ -121,6 +128,14 @@ AprilTagNode::AprilTagNode(const rclcpp::NodeOptions& options)
     declare_parameter("detector.refine", td->refine_edges, descr("snap to strong gradients"));
     declare_parameter("detector.sharpening", td->decode_sharpening, descr("sharpening of decoded images"));
     declare_parameter("detector.debug", td->debug, descr("write additional debugging images to working directory"));
+
+    declare_parameter("landmark.translation_weight", 1.0, descr("translation weight for landmark SLAM"));
+    declare_parameter("landmark.rotation_weight", 1.0, descr("rotation weight for landmark SLAM"));
+    declare_parameter("landmark.min_acceptable_distance", 4.0, descr("minimum acceptable distance for landmark SLAM"));
+
+    translation_weight_ = get_parameter("landmark.translation_weight").as_double();
+    rotation_weight_ = get_parameter("landmark.rotation_weight").as_double();
+    min_acceptable_distance_ = get_parameter("landmark.min_acceptable_distance").as_double();
 
     declare_parameter("max_hamming", 0, descr("reject detections with more corrected bits than allowed"));
     declare_parameter("profile", false, descr("print profiling information to stdout"));
@@ -176,14 +191,15 @@ void AprilTagNode::onCamera(const sensor_msgs::msg::Image::ConstSharedPtr& msg_i
         timeprofile_display(td->tp);
 
     apriltag_msgs::msg::AprilTagDetectionArray msg_detections;
+    cartographer_ros_msgs::msg::LandmarkList msg_landmarks;
     msg_detections.header = msg_img->header;
-
+    msg_landmarks.header = msg_img->header;
     std::vector<geometry_msgs::msg::TransformStamped> tfs;
-
     for(int i = 0; i < zarray_size(detections); i++) {
         apriltag_detection_t* det;
         zarray_get(detections, i, &det);
 
+        geometry_msgs::msg::Pose pose;
         RCLCPP_DEBUG(get_logger(),
                      "detection %3d: id (%2dx%2d)-%-4d, hamming %d, margin %8.3f\n",
                      i, det->family->nbits, det->family->h, det->id,
@@ -216,11 +232,29 @@ void AprilTagNode::onCamera(const sensor_msgs::msg::Image::ConstSharedPtr& msg_i
         if(estimate_pose != nullptr) {
             tf.transform = estimate_pose(det, intrinsics, size);
         }
+        double distance = std::sqrt(tf.transform.translation.x * tf.transform.translation.x + 
+                                    tf.transform.translation.y * tf.transform.translation.y + 
+                                    tf.transform.translation.z * tf.transform.translation.z);
 
+        if (distance < min_acceptable_distance_){
+            cartographer_ros_msgs::msg::LandmarkEntry landmark;
+            landmark.id = det->id;
+            landmark.translation_weight = translation_weight_;
+            landmark.rotation_weight = rotation_weight_;
+            landmark.tracking_from_landmark_transform.position.x = tf.transform.translation.x;
+            landmark.tracking_from_landmark_transform.position.y = tf.transform.translation.y;
+            landmark.tracking_from_landmark_transform.position.z = tf.transform.translation.z;
+            landmark.tracking_from_landmark_transform.orientation.x = tf.transform.rotation.x;
+            landmark.tracking_from_landmark_transform.orientation.y = tf.transform.rotation.y;
+            landmark.tracking_from_landmark_transform.orientation.z = tf.transform.rotation.z;
+            landmark.tracking_from_landmark_transform.orientation.w = tf.transform.rotation.w;
+            msg_landmarks.landmarks.push_back(landmark);
+        }
         tfs.push_back(tf);
     }
 
     pub_detections->publish(msg_detections);
+    pub_landmarks->publish(msg_landmarks);
     tf_broadcaster.sendTransform(tfs);
 
     apriltag_detections_destroy(detections);
